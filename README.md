@@ -1,5 +1,3 @@
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/74711453-f26e-417a-bfdc-22bb92ff85c0" /># PyMappers
-
 ###### <p align="center"> *This is official repository maintained by me*</center> </p>
 ###### <p align="center"> *[yigitdrbk](https://www.instagram.com/yigitdrbk/) *</center> </p>
 
