@@ -531,7 +531,7 @@ if __name__ == '__main__':
             password = getpass("Password: ")
             secret = getpass("Enable password (Enter if not): ")
             
-            prefer_napalm = False 
+            prefer_napalm = True 
             SwitchManager(ip, username, password, excel, platform=platform, prefer_napalm=prefer_napalm, conn_type=conn_type, secret=secret)
             
             again = input("Add another switch (Y/n): ").strip().lower()
