@@ -3,3 +3,8 @@ pandas==2.3.2
 netmiko==4.6.0
 napalm==5.1.0
 colorama==0.4.6
+napalm-procurve
+ntc-templates
+textfsm
+napalm-aruba-cx
+urllib3==2.6.3
