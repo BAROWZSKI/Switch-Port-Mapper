@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import re
 import os
+import sys
 from getpass import getpass
 import pandas as pd
 from netmiko import ConnectHandler
 from netmiko.ssh_autodetect import SSHDetect
 from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 from colorama import Fore, Style, init
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# urllib3 for disabling untrusted https traffic and unnecessary warning in cmd.
 
 try:
     from napalm import get_network_driver
@@ -42,17 +46,18 @@ COMMANDS = {
         'switchport': 'show vlan',
         'lag': 'show lacp info',
         'vlans': 'show vlan'
+    },
+    'aruba_aoscx': {  
+        'interfaces': 'show interface brief',
+        'descriptions': 'show interface brief',
+        'switchport': 'show vlan',
+        'lag': 'show lacp interfaces',
+        'vlans': 'show vlan'
     }
 }
 
-# ------------------ interface normalize (daha esnek) --------------------------
 def normalize_interface_names(ifname: str, vendor: str = None) -> str:
-    """
-    Daha genel bir normalizasyon:
-      - Başlangıçtaki harf bloğunu ve sonrasındaki 'num' bloğunu ayırır.
-      - Bilinen kısa isimleri uzun forma map eder.
-      - Eğer sadece 1/1/1 gibi sayısal format gelirse vendor'a göre prefix ekleyebilir.
-    """
+
     if not ifname or not isinstance(ifname, str):
         return ifname
 
@@ -64,8 +69,8 @@ def normalize_interface_names(ifname: str, vendor: str = None) -> str:
     # normalize common junos style like ge-0/0/0 -> keep as is but unify separators
     s = s.replace('.', '/')
 
-    # Try match: prefix (letters and punctuation) + numeric part
-    m = re.match(r'^(?P<prefix>[A-Za-z\-\_\/]*[A-Za-z]+)?\s*(?P<num>[\d\/\.\:]+.*)$', s)
+    # Try match: prefix (letters and punctuation) + numeric part regex kodun formatını standartlaştırır.
+    m = re.match(r'^(?P<prefix>[A-Za-z/_-]*[A-Za-z]+)?\s*(?P<num>[\d/.:]+.*)$', s)
     if m:
         prefix = (m.group('prefix') or '').strip()
         num = (m.group('num') or '').strip()
@@ -75,14 +80,15 @@ def normalize_interface_names(ifname: str, vendor: str = None) -> str:
             'Fa': 'FastEthernet', 'FastEthernet': 'FastEthernet',
             'Eth': 'Ethernet', 'Ethernet': 'Ethernet',
             'Te': 'TenGigabitEthernet', 'Port-channel': 'Port-channel',
-            'Po': 'Port-channel', 'ae': 'ae', 'ge': 'ge', 'xe': 'xe', 'ae': 'ae'
+            'Po': 'Port-channel', 'ae': 'ae', 'ge': 'ge', 'xe': 'xe',
+            'lo': 'Loopback','loopback': 'Loopback','l': 'Loopback','loop': 'Loopback',
         }
         # try to find a mapping key that matches the prefix (case-insensitive)
         for k, v in mapping.items():
             if prefix.lower().startswith(k.lower()):
                 return f"{v}{num}"
         # default: if prefix empty and num like 1/1/1 -> assume Ethernet on many vendors
-        if not prefix and re.match(r'^[\d]+(\/[\d]+)*', num):
+        if not prefix and re.match(r'^\d+(\/\d+)*', num):
             # vendor-specific default can be improved
             if vendor and 'juniper' in vendor:
                 return f"ge-{num}"
@@ -104,7 +110,7 @@ def display_banner():
         ██████╔╝ ╚████╔╝ ██╔████╔██║███████║██████╔╝██████╔╝█████╗  ██████╔╝
         ██╔═══╝   ╚██╔╝  ██║╚██╔╝██║██╔══██║██╔═══╝ ██╔═══╝ ██╔══╝  ██╔══██╗
         ██║        ██║   ██║ ╚═╝ ██║██║  ██║██║     ██║     ███████╗██║  ██║
-        ╚═╝        ╚═╝   ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝                                                                    
+        ╚═╝        ╚═╝   ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝                                                               
     """
     banner_color = Fore.CYAN + Style.BRIGHT
     print(banner_color + banner_art)
@@ -112,16 +118,22 @@ def display_banner():
     tagline_color = Fore.YELLOW + Style.BRIGHT
 
     print(tagline_color + tagline)
-    print("\n" + "=" * 75 + "\n")
+    print("=" * 75)
 
-# ------------------ SwitchManager (özetlenmiş) -------------------------------
 class SwitchManager:
-    def __init__(self, ip, username, password, excel_dosyasi, platform=None, prefer_napalm=True):
+    def __init__(self, ip, username, password, excel_dosyasi, platform=None, prefer_napalm=True, conn_type="ssh", secret=""):
         self.ip = ip
         self.username = username
         self.password = password
-        self.platform = platform  # netmiko device_type / napalm driver name
-        self.prefer_napalm = prefer_napalm and NAPALM_AVAILABLE
+        self.platform = platform
+        self.conn_type = conn_type
+        self.secret = secret
+        
+        # If connection is serial than napalm is useless
+        if self.conn_type == "serial":
+            self.prefer_napalm = False
+        else:
+            self.prefer_napalm = prefer_napalm and NAPALM_AVAILABLE
         self.excel = excel_dosyasi
 
         self.toplanan_veriler = []
@@ -142,7 +154,11 @@ class SwitchManager:
         if self.platform:
             return self.platform
 
-        # SSHDetect kullanarak auto-detect denemesi (Netmiko). Bazen hatalı olabilir.
+        if self.conn_type == "serial":
+            print("Can't run autodetect when connection is serial")
+            return None
+
+        # Using SSHDetect auto-detect in Netmiko we are trying to detect the vendor  
         device = {"device_type": "autodetect", "host": self.ip, "username": self.username, "password": self.password}
         try:
             guesser = SSHDetect(**device)
@@ -155,55 +171,56 @@ class SwitchManager:
             return None
 
     def run_collection(self):
-        # 1) platform tespiti
+        # 1) Manually checking the platform with detect_platform function
         platform = self.detect_platform()
         print("Platform in use :", platform)
 
         # Platform attribute must be fixed from now
 
-        # 2) Eğer NAPALM tercih edildiyse ve driver var ise napalm akışı:
+        # NAPALM FLOW
         if self.prefer_napalm and platform:
             napalm_name = None
-            # Simple mapping (örn: netmiko 'juniper_junos' -> napalm 'junos')
+            # Simple mapping 
             if 'juniper' in platform:
                 napalm_name = 'junos'
             elif 'cisco_ios' in platform or 'cisco' in platform:
                 napalm_name = 'ios'
-            elif 'aruba' in platform or 'aoscx' in platform:
+            elif 'aruba' in platform or 'aruba_aoscx' in platform:
                 napalm_name = 'aoscx'  # community driver may be needed
             elif 'hp_procurve' in platform or 'procurve' in platform:
                 napalm_name = 'procurve'
             if napalm_name:
                 try:
-                    driver = get_network_driver(napalm_name)    # get network driver aslında sınıf döndürür.
-                    optional_args = {}      # driver aslında bir sınıftır. Bu sınıftan device diye bir obje oluşturarak bağlantı kurulur.
+                    driver = get_network_driver(napalm_name)    # get network driver returns object.
+                    optional_args = {}      # Driver is actually just a class. We create device object from that class.
+                    if self.secret:
+                        optional_args['secret'] = self.secret
                     device = driver(hostname=self.ip, username=self.username, password=self.password, optional_args=optional_args)
-                    # device objesi ise bir bağlantı başlatmaya ve parametrelerin verilmesi işine yarıyor.
                     device.open()
                     print("NAPALM in use")
                     facts = device.get_facts()
                     self.hostname = facts.get('hostname', self.ip)
-                    # get interfaces + ips + vlans (varsa)
-                    interfaces = device.get_interfaces()   # bu da çıktıyı döner "GigabitEthernet0/1": {"is_up": True, "is_enabled": True, "description": "uplink"},
-                    interfaces_ip = device.get_interfaces_ip()  # her interface için "GigabitEthernet0/1": {"ipv4": {"192.168.1.1": {"mask": 24}}}, döner mesela
+                    # get interfaces + ips + vlans (if exist)
+                    interfaces = device.get_interfaces()   # "GigabitEthernet0/1": {"is_up": True, "is_enabled": True, "description": "uplink"},
+                    interfaces_ip = device.get_interfaces_ip()  # for every interface  "GigabitEthernet0/1": {"ipv4": {"192.168.1.1": {"mask": 24}}}, döner mesela
                     vlans = {}
                     # in case if no vlans in vlans attribute
                     try:
                         vlans = device.get_vlans()
                     except Exception:
                         vlans = {}
-                    # her interface için interface detayları ve meta datarrı almaya çalışıyoruz.
+                    # First loops gathers only vlan values
                     for ifname, meta in interfaces.items():
                         normalized = normalize_interface_names(ifname, vendor=platform)
                         ip_addr = interfaces_ip.get(ifname, {})
                         ip_str = ''
-                        # eğer birkaç ip varsa ( yani dict varsa ) bunları ayır.
+                        # if there is multiple ip (type dict) seperates.
                         if ip_addr:
-                            # ipv4 dict varsa
+                            # if ipv4 dict 
                             ipv4 = ip_addr.get('ipv4') or {}
                             if ipv4:
                                 ip_str = ','.join(list(ipv4.keys()))
-                        # eğer meta.get ile is_up alabiliyorsan bir interfaceden bu up olsun direkt. Diğer türlü de down olsun.
+
                         status = 'up' if meta.get('is_up') else 'down'
                         description = meta.get('description', ' - ')
                         # vlan lookup (napalm get_vlans returns mapping vlan_id -> {name, interfaces})
@@ -212,13 +229,8 @@ class SwitchManager:
                             ints = vobj.get('interfaces') or []
                             if ifname in ints or normalized in ints:
                                 vlan_info = f"{vid}({vobj.get('name')})"
-                                self.vlan_verileri.append({
-                                    'Hostname': self.hostname,
-                                    'Vlan_id': vid,
-                                    'Vlan Name': vobj.get('name'),
-                                    'Atanan_portlar': ', '.join(ints)
-                                })
                                 break
+                            
                         self.toplanan_veriler.append({
                             "Hostname": self.hostname,
                             "Port": normalized,
@@ -230,28 +242,71 @@ class SwitchManager:
                             "Etherchannel": ' - '
                         })
 
+                    for vid, vobj in vlans.items():
+                        ints = vobj.get('interfaces') or []
+                        self.vlan_verileri.append({
+                            'Hostname': self.hostname,
+                            'Vlan_id': vid,
+                            'Vlan Name': vobj.get('name'),
+                            'Atanan_portlar': ', '.join(ints)
+                        })
+                                
                     device.close()
                     print("Napalm successful.")
                     return True
                 except Exception as e:
                     print("Napalm not successful , trying Netmiko:", e)
-                    # fallback Netmiko'ya devam edeceğiz
 
         # 3) Netmiko flow (fallback / or directly if prefer_napalm is False)
         try:
             print("Netmiko flow is running")
-            dev = {"device_type": platform, "host": self.ip,
-                   "username": self.username, "password": self.password,
-                   "global_delay_factor": 2}
+            
+            used_platform = platform
+            if self.conn_type == "serial" and platform:
+                if not platform.endswith("_serial"):
+                    used_platform = platform + "_serial"
+            
+            if self.conn_type == "serial":
+                dev = {
+                    "device_type": platform,
+                    "serial_port": self.ip,
+                    "username": self.username,
+                    "password": self.password,
+                    "secret": self.secret,
+                    "global_delay_factor": 2
+                    }
+            else:
+                dev = {
+                    "device_type": platform,
+                    "host": self.ip,
+                    "username": self.username,
+                    "password": self.password,
+                    "secret": self.secret,
+                    "global_delay_factor": 2
+                    }
+                
+            
             with ConnectHandler(**dev) as net_connect:
+                # check if there is enable password
+                if not net_connect.check_enable_mode():
+                    print("Going in enable mode")
+                    net_connect.enable()
+                
+                
                 self.hostname = net_connect.base_prompt
-                used_platform = platform or dev['device_type']
-                cmds_for = COMMANDS.get(used_platform)
+                
+                # _serial extension is not in the COMMANDS directory so we extract it
+                base_platform = used_platform.replace("_serial", "") if used_platform else dev.get('device_type', '').replace("_serial", "")
+                cmds_for = COMMANDS.get(base_platform)
 
-                # 1 - interfaces
+                if not cmds_for:
+                    print(f"There is no command set for {base_platform}")
+                    return False
+
                 out_if = net_connect.send_command(cmds_for['interfaces'], use_textfsm=True)
+
                 # out_if is often list of dicts when TF exists, else raw str
-                parsed_if_list = []     # buraya tek tek cihazdaki tüm interface isimleri gelir
+                parsed_if_list = []     # All interface names comes here
                 if isinstance(out_if, list):
                     parsed_if_list = out_if
                 else:
@@ -374,6 +429,7 @@ class SwitchManager:
             return False
 
     def export_to_excel(self):
+
         print("Writing to excel:", self.excel)
         yeni_arayuz_df = pd.DataFrame(self.toplanan_veriler)
         yeni_vlan_df = pd.DataFrame(self.vlan_verileri)
@@ -381,49 +437,110 @@ class SwitchManager:
         cols_vlan = ['Hostname', 'Vlan_id', 'Vlan Name', 'Atanan_portlar']
         yeni_arayuz_df = yeni_arayuz_df.reindex(columns=cols_ar)
         yeni_vlan_df = yeni_vlan_df.reindex(columns=cols_vlan)
-        try:
-            mevcut = {}
+
+        # If file not exist , then create one
+        if not os.path.exists(self.excel):
             try:
-                mevcut = pd.read_excel(self.excel, sheet_name=None)
-            except FileNotFoundError:
-                mevcut = {}
-            mevcut_ar = mevcut.get('Interface_Information', pd.DataFrame())
-            mevcut_vlan = mevcut.get('VLAN_List', pd.DataFrame())
+                with pd.ExcelWriter(self.excel, engine='openpyxl', mode='w') as writer:
+                    yeni_arayuz_df.to_excel(writer, sheet_name='Interface_Information', index=False)
+                    yeni_vlan_df.to_excel(writer, sheet_name='VLAN_List', index=False)
+                print("Excel file created and data written.")
+                return
+            except Exception as e:
+                print("Error creating excel file:", e)
+                return
+
+        # If file exist , read the related pages, write down it, clear the duplicate, then replace the pages.
+        try:
+            mevcut_ar = pd.DataFrame(columns=cols_ar)
+            mevcut_vlan = pd.DataFrame(columns=cols_vlan)
+
+            try:
+                mevcut_ar = pd.read_excel(self.excel, sheet_name='Interface_Information')
+            except Exception:
+                # sheet yok veya okunamadı -> boş bırak
+                mevcut_ar = pd.DataFrame(columns=cols_ar)
+
+            try:
+                mevcut_vlan = pd.read_excel(self.excel, sheet_name='VLAN_List')
+            except Exception:
+                mevcut_vlan = pd.DataFrame(columns=cols_vlan)
+
+            # add the datas with conocat
             merged_ar = pd.concat([mevcut_ar, yeni_arayuz_df], ignore_index=True)
             merged_vlan = pd.concat([mevcut_vlan, yeni_vlan_df], ignore_index=True)
-            merged_ar.drop_duplicates(subset=['Hostname', 'Port'], keep='last', inplace=True)
-            merged_vlan.drop_duplicates(subset=['Hostname', 'Vlan_id'], keep='last', inplace=True)
-            with pd.ExcelWriter(self.excel, engine='openpyxl') as writer:
+
+            # clear duplicates
+            if not merged_ar.empty:
+                merged_ar.drop_duplicates(subset=['Hostname', 'Port'], keep='last', inplace=True)
+            if not merged_vlan.empty:
+                merged_vlan.drop_duplicates(subset=['Hostname', 'Vlan_id'], keep='last', inplace=True)
+
+            # Pandas >= 1.3: if_sheet_exists param available; mode='a' with if_sheet_exists='replace' replaces target sheets
+            with pd.ExcelWriter(self.excel, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                 merged_ar.to_excel(writer, sheet_name='Interface_Information', index=False)
                 merged_vlan.to_excel(writer, sheet_name='VLAN_List', index=False)
-            print("Excel up to date.")
+
+            print("Excel updated (sheets replaced).")
         except Exception as e:
             print("Excel writing error:", e)
 
 if __name__ == '__main__':
-
-    excel = 'switch_info.xlsx'
-
+    excel = 'switch_info.xlsx' # Dosya adı
     clear_screen()
     display_banner()
     print("")
-    while True:
-        platform = None
-        platform_input = input("Enter the Device type (ex: ciso, juniper, aruba, hp, autodetect \nFor (q) to quit :").strip() or None
-        if "cisco" in platform_input:
-            platform = "cisco_ios"
-        elif "juniper" in platform_input:
-            platform = "juniper_junos"
-        elif "aruba" in platform_input:
-            platform = "aruba_os"
-        elif "hp" in platform_input:
-            platform = "hp_procurve"
-        elif platform_input == 'q' or platform_input=='Q':
-            break
-        else:
-            print("No switch type is found")
-        ip = input("Switch IP/hostname: ")
-        username = input("Username: ")
-        password = getpass("Password: ")
-        prefer_napalm = True # Make it false if you don't want to use Napalm
-        SwitchManager(ip, username, password, excel, platform=platform, prefer_napalm=prefer_napalm)
+
+    try:
+        while True:
+            
+            print("Select your connection type (1/2)")
+            connection_input = input("1)SSH\n2)Console\n").strip()
+            
+            conn_type = "ssh" if connection_input == "1" else "serial" 
+            
+            platform = None
+            print("\n--- Platform Selection ---")
+            platform_input = input("Enter the Device type (ex: \n*cicso, \n*juniper, \n*aruba(if aruba edge sw),\n*arubaBb(if Aruba BB sw), \n*hp, \n*autodetect \nFor (q) to quit :").strip() or None
+                        
+            if not platform_input:
+                continue
+
+            if "cisco" in platform_input:
+                platform = "cisco_ios"
+            elif "juniper" in platform_input:
+                platform = "juniper_junos"
+            elif "arubaBb" in platform_input: 
+                platform = "aruba_aoscx"
+            elif "aruba" in platform_input:
+                platform = "hp_procurve"
+            elif "hp" in platform_input:
+                platform = "hp_procurve"
+            elif platform_input.lower() in ['q', 'quit', 'exit']:
+                print("Exiting program...")
+                break
+            else:
+                print("No switch type found or invalid input.")
+                continue
+            
+            if conn_type == "serial":
+                ip = input("Enter you port (COM3, /dev/ttyUSB0) : ").strip()
+            else:
+                ip = input("Switch IP/hostname: ").strip()                
+            username = input("Username: ")
+            password = getpass("Password: ")
+            secret = getpass("Enable password (Enter if not): ")
+            
+            prefer_napalm = False 
+            SwitchManager(ip, username, password, excel, platform=platform, prefer_napalm=prefer_napalm, conn_type=conn_type, secret=secret)
+            
+            again = input("Add another switch (Y/n): ").strip().lower()
+            if again != 'y':
+                print("Shutting down the programme.")
+                break
+
+    except KeyboardInterrupt:
+        print(Fore.RED + "\n\n[!] Process cancelled by user (Ctrl+C). Ending program..." + Style.RESET_ALL)
+        sys.exit() 
+    except Exception as e:
+        print(f"\nUnexpected error occured: {e}")
