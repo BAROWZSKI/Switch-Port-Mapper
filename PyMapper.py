@@ -3,6 +3,8 @@ import re
 import os
 import sys
 from getpass import getpass
+import time
+import serial
 import pandas as pd
 from netmiko import ConnectHandler
 from netmiko.ssh_autodetect import SSHDetect
@@ -55,6 +57,20 @@ COMMANDS = {
         'vlans': 'show vlan'
     }
 }
+
+def clean_output(raw, cmd):
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    raw = ansi_escape.sub('', raw)
+    lines = raw.splitlines()
+    cleaned = []
+    for line in lines:
+        if cmd.strip() in line:
+            continue
+        # Prompt içeren satırları tamamen sil (tek veya çift prompt)
+        if re.search(r'\S+[>#]\s*$', line):
+            continue
+        cleaned.append(line)
+    return '\n'.join(cleaned)
 
 def normalize_interface_names(ifname: str, vendor: str = None) -> str:
 
@@ -121,13 +137,14 @@ def display_banner():
     print("=" * 75)
 
 class SwitchManager:
-    def __init__(self, ip, username, password, excel_dosyasi, platform=None, prefer_napalm=True, conn_type="ssh", secret=""):
+    def __init__(self, ip, username, password, excel_dosyasi, platform=None, prefer_napalm=True, conn_type="ssh", secret="", secret_user = ""):
         self.ip = ip
         self.username = username
         self.password = password
         self.platform = platform
         self.conn_type = conn_type
         self.secret = secret
+        self.secret_user = secret_user
         
         # If connection is serial than napalm is useless
         if self.conn_type == "serial":
@@ -147,6 +164,8 @@ class SwitchManager:
             print("-> Connection established but no interface data found.")
         else:
             print("-> Connection couldn't establilshed .")
+
+
 
     # Tries SSHDetect to detect platform
     def detect_platform(self):
@@ -172,7 +191,7 @@ class SwitchManager:
 
     def run_collection(self):
         # 1) Manually checking the platform with detect_platform function
-        platform = self.detect_platform()
+        platform = self.platform or self.detect_platform()
         print("Platform in use :", platform)
 
         # Platform attribute must be fixed from now
@@ -250,7 +269,7 @@ class SwitchManager:
                             'Vlan Name': vobj.get('name'),
                             'Atanan_portlar': ', '.join(ints)
                         })
-                                
+
                     device.close()
                     print("Napalm successful.")
                     return True
@@ -261,41 +280,59 @@ class SwitchManager:
         try:
             print("Netmiko flow is running")
             
+            # _serial takısını konsol bağlantıları için mecburen ekliyoruz
             used_platform = platform
             if self.conn_type == "serial" and platform:
                 if not platform.endswith("_serial"):
                     used_platform = platform + "_serial"
             
             if self.conn_type == "serial":
-                dev = {
-                    "device_type": platform,
-                    "serial_port": self.ip,
-                    "username": self.username,
-                    "password": self.password,
-                    "secret": self.secret,
-                    "global_delay_factor": 2
-                    }
+                base_platform = platform.replace("_serial", "") if "_serial" in platform else platform
+                return self._serial_collect(base_platform)
             else:
                 dev = {
-                    "device_type": platform,
-                    "host": self.ip,
+                    "device_type": platform,              # Örn: hp_procurve (SSH için)
+                    "host": self.ip,                      # SSH için IP adresi
                     "username": self.username,
                     "password": self.password,
                     "secret": self.secret,
                     "global_delay_factor": 2
                     }
-                
-            
+        
             with ConnectHandler(**dev) as net_connect:
-                # check if there is enable password
+                if self.conn_type == "serial":
+                    net_connect.write_channel("\r\n")
+                    time.sleep(2)
+                    output = net_connect.read_channel()
+                        
+                    # send credential if login requires
+                    if "username" in output.lower() or "login" in output.lower():
+                        net_connect.write_channel(self.username + "\n")
+                        time.sleep(1)
+                        output = net_connect.read_channel()
+                    
+                    if "password" in output.lower():
+                        net_connect.write_channel(self.password + "\n")
+                        time.sleep(2)
+                        output = net_connect.read_channel()
+                    
+                    from netmiko import redispatch
+                    redispatch(net_connect, device_type=base_platform)  # örn: "hp_procurve"
+                    
                 if not net_connect.check_enable_mode():
-                    print("Going in enable mode")
-                    net_connect.enable()
-                
+                    print("Enable mode activating...")
+                    if self.secret_user:
+                        output = net_connect.send_command_timing("enable")
+                        if "sername" in output.lower() or "login" in output.lower():
+                            output += net_connect.send_command_timing(self.secret_user)
+                        if "ssword" in output.lower() or "word:" in output.lower():
+                            net_connect.send_command_timing(self.secret)
+                    else:
+                        net_connect.enable()
                 
                 self.hostname = net_connect.base_prompt
                 
-                # _serial extension is not in the COMMANDS directory so we extract it
+                # _serial uzantısı COMMANDS sözlüğünde olmadığı için komut ararken onu siliyoruz
                 base_platform = used_platform.replace("_serial", "") if used_platform else dev.get('device_type', '').replace("_serial", "")
                 cmds_for = COMMANDS.get(base_platform)
 
@@ -340,7 +377,7 @@ class SwitchManager:
                     # keys differ between templates; try common ones
                     port = iface.get('interface') or iface.get('port') or iface.get('intf') or iface.get('name')
                     if not port: continue
-                    normalized = normalize_interface_names(port, vendor=used_platform)
+                    normalized = normalize_interface_names(port, vendor=platform)
                     interface_details[normalized] = {
                         "ip_address": iface.get('ip_address') or iface.get('ip') or ' - ',
                         "status": iface.get('status') or iface.get('oper') or ' - ',
@@ -427,6 +464,194 @@ class SwitchManager:
         except Exception as e:
             print("Unexpected error:", e)
             return False
+
+    def _serial_collect(self, base_platform):
+        from ntc_templates.parse import parse_output
+
+        try:
+            ser = serial.Serial(port=self.ip, baudrate=9600, timeout=3)
+
+            # send function tries to wake switch up
+            def send(cmd, wait=8):
+                ser.write((cmd + "\r\n").encode())
+                time.sleep(2)
+                output = ""
+                deadline = time.time() + wait
+                while time.time() < deadline:
+                    if ser.in_waiting:
+                        output += ser.read(ser.in_waiting).decode(errors='ignore')
+                        if any(output.strip().endswith(p) for p in ('#', '>')):
+                            break
+                    time.sleep(1)
+                return output
+
+            # ── Login flow from now ── #
+            output = send("", wait=3)
+            print(f"1) WAKE: {repr(output)}")
+
+            if "press any key" in output.lower():
+                output = send("", wait=3)
+                print(f"2) PRESS ANY KEY: {repr(output)}")
+
+            if "username" in output.lower() or "login" in output.lower():
+                output = send(self.username, wait=3)
+                print(f"3) USERNAME SENT: {repr(output)}")
+
+            if "password" in output.lower():
+                output = send(self.password, wait=3)
+                print(f"4) PASSWORD SENT: {repr(output)}")
+
+            output = send("enable", wait=3)
+            print(f"5) ENABLE: {repr(output)}")
+
+            # Switch enable için username+password istiyor
+            if "username" in output.lower() or "sername" in output.lower():
+                enable_user = self.secret_user if self.secret_user else self.username
+                output = send(enable_user, wait=3)
+                print(f"5b) ENABLE USER: {repr(output)}")
+
+                # Username sonrası password bekliyorsa gönder
+                if "password" in output.lower():
+                    enable_pw = self.secret if self.secret else self.password
+                    output = send(enable_pw, wait=3)
+                    print(f"5c) ENABLE PW AFTER USER: {repr(output)}")
+
+            elif "password" in output.lower():
+                # Direkt password sorduysa (username sormadan)
+                enable_pw = self.secret if self.secret else self.password
+                output = send(enable_pw, wait=3)
+                print(f"6) ENABLE PW: {repr(output)}")
+
+            output = send("no page", wait=3)
+            print(f"7) NO PAGE: {repr(output)}")
+
+            # Hostname: prompt'un son satırından al (ANSI temizlenmiş hali)
+            clean_last = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
+            last_line = clean_last.strip().splitlines()[-1] if clean_last.strip() else ""
+            self.hostname = last_line.replace("#", "").replace(">", "").strip() or "console_device"
+            print(f"HOSTNAME: {self.hostname}")
+
+            # ── COMMANDS dict'ten komutları gönder ve parse et ───────
+            cmds_for = COMMANDS.get(base_platform)
+            if not cmds_for:
+                print(f"No command set for {base_platform}")
+                ser.close()
+                return False
+
+            raw_outputs = {}
+            for key, cmd in cmds_for.items():
+                raw = send(cmd, wait=5)
+                raw = clean_output(raw, cmd)
+                print(f"\n{'='*50}")
+                print(f"CMD: {cmd}")
+                print(f"RAW OUTPUT:\n{repr(raw[:500])}")
+                # ──────────────────
+                
+                
+                try:
+                    parsed = parse_output(platform=base_platform, command=cmd, data=raw)
+                    raw_outputs[key] = parsed if isinstance(parsed, list) else []
+                except Exception as e:
+                    print(f"TextFSM parse failed for '{cmd}': {e}")
+                    raw_outputs[key] = []
+
+            ser.close()
+
+            # ── SSH flow ile AYNI parse mantığı ─────────────────────
+            parsed_if_list = raw_outputs.get('interfaces', [])
+            parsed_desc    = raw_outputs.get('descriptions', [])
+            parsed_sw      = raw_outputs.get('switchport', [])
+            parsed_vlans   = raw_outputs.get('vlans', [])
+            out_lag        = raw_outputs.get('lag', [])
+
+            interface_details = {}
+
+            for iface in parsed_if_list:
+                port = iface.get('interface') or iface.get('port') or iface.get('intf') or iface.get('name')
+                if not port:
+                    continue
+                normalized = normalize_interface_names(port, vendor=base_platform)
+                interface_details[normalized] = {
+                    "ip_address":   iface.get('ip_address') or iface.get('ip') or ' - ',
+                    "status":       iface.get('status') or iface.get('oper') or ' - ',
+                    "protocol":     iface.get('proto') or iface.get('protocol') or ' - ',
+                    "description":  " - ",
+                    "vlan":         " - ",
+                    "etherchannel": " - "
+                }
+
+            for d in parsed_desc:
+                port = d.get('port') or d.get('interface') or d.get('name')
+                if not port:
+                    continue
+                normalized = normalize_interface_names(port, vendor=base_platform)
+                if normalized in interface_details:
+                    interface_details[normalized]['description'] = (
+                        d.get('description') or d.get('desc') or interface_details[normalized]['description']
+                    )
+
+            for sw in parsed_sw:
+                port = sw.get('interface') or sw.get('port') or sw.get('name')
+                if not port:
+                    continue
+                normalized = normalize_interface_names(port, vendor=base_platform)
+                if normalized in interface_details:
+                    mode = sw.get('mode') or ''
+                    if 'access' in mode.lower():
+                        interface_details[normalized]['vlan'] = f"Access({sw.get('access_vlan', '')})"
+                    elif 'trunk' in mode.lower():
+                        interface_details[normalized]['vlan'] = f"Trunk({sw.get('trunk_vlans', '')})"
+                    else:
+                        if sw.get('vlan'):
+                            interface_details[normalized]['vlan'] = sw.get('vlan')
+
+            if isinstance(out_lag, list):
+                for g in out_lag:
+                    bundle  = g.get('bundle_name') or g.get('group') or g.get('lag')
+                    members = g.get('member_interface') or g.get('members') or []
+                    for m in members:
+                        nm = normalize_interface_names(m, vendor=base_platform)
+                        if nm in interface_details:
+                            interface_details[nm]['etherchannel'] = bundle
+
+            for v in parsed_vlans:
+                ports = v.get('interfaces') or v.get('ports') or v.get('assigned_ports') or []
+                for p in ports:
+                    nm = normalize_interface_names(p, vendor=base_platform)
+                    if nm in interface_details:
+                        interface_details[nm]['vlan'] = (
+                            f"{v.get('vlan_id') or v.get('vlan', '')}({v.get('vlan_name') or v.get('name', '')})"
+                        )
+
+            # toplanan_veriler'e ekle
+            for port, det in interface_details.items():
+                self.toplanan_veriler.append({
+                    "Hostname":     self.hostname,
+                    "Port":         port,
+                    "Status":       det["status"],
+                    "Protocol":     det["protocol"],
+                    "Ip_address":   det["ip_address"],
+                    "Vlan":         det["vlan"],
+                    "Description":  det["description"],
+                    "Etherchannel": det["etherchannel"]
+                })
+
+            # VLAN sheet
+            for v in parsed_vlans:
+                ports = v.get('interfaces') or v.get('ports') or []
+                norm_ports = [normalize_interface_names(p, vendor=base_platform) for p in ports]
+                self.vlan_verileri.append({
+                    'Hostname':      self.hostname,
+                    'Vlan_id':       v.get('vlan_id') or v.get('vlan') or v.get('id'),
+                    'Vlan Name':     v.get('vlan_name') or v.get('name'),
+                    'Atanan_portlar': ', '.join(norm_ports)
+                })
+
+            return True
+
+        except Exception as e:
+            print(f"Serial connection error: {e}")
+        return False
 
     def export_to_excel(self):
 
@@ -522,18 +747,19 @@ if __name__ == '__main__':
             else:
                 print("No switch type found or invalid input.")
                 continue
-            
+
             if conn_type == "serial":
                 ip = input("Enter you port (COM3, /dev/ttyUSB0) : ").strip()
             else:
                 ip = input("Switch IP/hostname: ").strip()                
             username = input("Username: ")
             password = getpass("Password: ")
-            secret = getpass("Enable password (Enter if not): ")
             
-            prefer_napalm = True 
-            SwitchManager(ip, username, password, excel, platform=platform, prefer_napalm=prefer_napalm, conn_type=conn_type, secret=secret)
+            secret_user = input("Enable Username (Ana username ile aynıysa veya yoksa Enter'a bas): ").strip()
+            secret = getpass("Enable Password (Yoksa Enter'a bas): ")
             
+            prefer_napalm = False 
+            SwitchManager(ip, username, password, excel, platform=platform, prefer_napalm=prefer_napalm, conn_type=conn_type, secret=secret, secret_user=secret_user)
             again = input("Add another switch (Y/n): ").strip().lower()
             if again != 'y':
                 print("Shutting down the programme.")
