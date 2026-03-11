@@ -8,3 +8,4 @@ ntc-templates
 textfsm
 napalm-aruba-cx
 urllib3==2.6.3
+pyserial==3.5
